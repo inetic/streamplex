@@ -33,49 +33,8 @@ struct connect_entry {
     }
 };
 
-struct plex_loop_state {
-    bool was_destroyed = false;
-    std::queue<connect_entry> tx_queue;
-
-    void on_write(const sys::error_code&)
-    {
-        // TODO: Clear depleted tx_queue entries and
-        // move partially sent entries to the back of
-        // the queue.
-    }
-
-    size_t prepare_payload( const size_t max_size
-                          , std::vector<asio::const_buffer>& out_buffs)
-    {
-        size_t cur_size = 0;
-    
-        for(size_t count = tx_queue.size(); count; --count) {
-            auto e = std::move(tx_queue.front());
-            tx_queue.pop();
-    
-            bool   is_done;
-            size_t added;
-            size_t remaining = max_size - cur_size;
-    
-            std::tie(is_done, added) = e.fill_buffer(remaining, out_buffs);
-    
-            cur_size += added;
-    
-            if (!is_done) {
-                tx_queue.push(std::move(e));
-            }
-    
-            if (cur_size >= max_size) {
-                break;
-            }
-        }
-    
-        return cur_size;
-    }
-};
-
 template<class Stream>
-class plex_loop {
+class plex_loop : public std::enable_shared_from_this<plex_loop<Stream>> {
 public:
     plex_loop(Stream stream);
 
@@ -87,22 +46,25 @@ public:
     template<class OnConnect>
     void set_on_connect(OnConnect&&);
 
-    ~plex_loop();
+    void mark_stopped();
 
 private:
     void start_transmit_loop();
 
+    size_t prepare_payload( const size_t max_size
+                          , std::vector<asio::const_buffer>& out_buffs);
+
 private:
     Stream _stream;
-    std::shared_ptr<plex_loop_state> _state;
     std::vector<asio::const_buffer> _tx_buffers;
+    bool _is_stopped = false;
+    std::queue<connect_entry> _tx_entry_queue;
 };
 
 template<class Stream>
 inline
 plex_loop<Stream>::plex_loop(Stream stream)
     : _stream(std::move(stream))
-    , _state(std::make_shared<plex_loop_state>())
 {}
 
 template<class Stream>
@@ -119,7 +81,7 @@ inline
 void plex_loop<Stream>::set_on_connect(OnConnect&& h)
 {
     connect_entry ce(std::forward<OnConnect>(h));
-    _state->tx_queue.push(std::move(ce));
+    _tx_entry_queue.push(std::move(ce));
     start_transmit_loop();
 }
 
@@ -131,24 +93,55 @@ plex_loop<Stream>::start_transmit_loop()
     if (_tx_buffers.size()) return;
 
     const size_t max_size = 65536;
-    const size_t size = _state->prepare_payload(max_size, _tx_buffers);
+    const size_t size = prepare_payload(max_size, _tx_buffers);
 
     if (size == 0) return;
 
     asio::async_write(_stream, _tx_buffers
-                     , [this, s = _state](sys::error_code ec, size_t)
+                     , [this, self = plex_loop<Stream>::shared_from_this()]
+                       (sys::error_code ec, size_t)
                        {
-                           if (!ec && s->was_destroyed) {
+                           if (!ec && _is_stopped) {
                                ec = asio::error::operation_aborted;
                            }
-
-                           s->on_write(ec);
 
                            if (ec) return;
 
                            _tx_buffers.resize(0);
                            start_transmit_loop();
                        });
+}
+
+template<class Stream>
+inline
+size_t
+plex_loop<Stream>::prepare_payload( const size_t max_size
+                                  , std::vector<asio::const_buffer>& out_buffs)
+{
+    size_t cur_size = 0;
+
+    for (size_t count = _tx_entry_queue.size(); count; --count) {
+        auto e = std::move(_tx_entry_queue.front());
+        _tx_entry_queue.pop();
+
+        bool   is_done;
+        size_t added;
+        size_t remaining = max_size - cur_size;
+
+        std::tie(is_done, added) = e.fill_buffer(remaining, out_buffs);
+
+        cur_size += added;
+
+        if (!is_done) {
+            _tx_entry_queue.push(std::move(e));
+        }
+
+        if (cur_size >= max_size) {
+            break;
+        }
+    }
+
+    return cur_size;
 }
 
 template<class Stream>
@@ -161,9 +154,10 @@ plex_loop<Stream>::get_io_service()
 
 template<class Stream>
 inline
-plex_loop<Stream>::~plex_loop()
+void
+plex_loop<Stream>::mark_stopped()
 {
-    _state->was_destroyed = true;
+    _is_stopped = true;
 }
 
 } // streamplex namespace

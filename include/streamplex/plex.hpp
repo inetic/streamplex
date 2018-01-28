@@ -26,6 +26,8 @@ public:
     typename detail::result_t<Token, socket_t>::type
     async_connect(Token&&);
 
+    ~plex();
+
 private:
     std::shared_ptr<plex_loop<Stream>> _loop;
 };
@@ -34,6 +36,12 @@ template<class Stream>
 plex<Stream>::plex(Stream&& stream)
     : _loop(std::make_shared<plex_loop<Stream>>(std::move(stream)))
 {
+}
+
+template<class Stream>
+plex<Stream>::~plex()
+{
+    _loop->mark_stopped();
 }
 
 template<class Stream>
