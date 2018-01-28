@@ -4,20 +4,33 @@
 #include <boost/asio/write.hpp>
 #include <queue>
 
+#include "namespaces.hpp"
+
 namespace streamplex {
 
 struct connect_entry {
     using handler_t = std::function<void(const sys::error_code&)>;
 
     handler_t handler;
-    std::vector<uint8_t> message;
-    asio::const_buffer buffer;
+    uint8_t data;
 
-    connect_entry(handler_t h, std::vector<uint8_t> m)
+    connect_entry(handler_t h)
         : handler(std::move(h))
-        , message(std::move(m))
-        , buffer(message.data(), message.size())
     {}
+
+    // Returns:
+    // first:  Whether it's done.
+    // second: The number of bytes added to `target`.
+    std::pair<bool, size_t>
+    fill_buffer(size_t capacity_left, std::vector<asio::const_buffer>& target)
+    {
+        size_t size = sizeof(data);
+        // This func is called with at capacity_left > 0, and we only need one
+        // byte.
+        assert(capacity_left >= size);
+        //target.push_back(asio::const_buffer(data&, size));
+        return std::make_pair(true, size);
+    }
 };
 
 struct plex_loop_state {
@@ -29,6 +42,35 @@ struct plex_loop_state {
         // TODO: Clear depleted tx_queue entries and
         // move partially sent entries to the back of
         // the queue.
+    }
+
+    size_t prepare_payload( const size_t max_size
+                          , std::vector<asio::const_buffer>& out_buffs)
+    {
+        size_t cur_size = 0;
+    
+        for(size_t count = tx_queue.size(); count; --count) {
+            auto e = std::move(tx_queue.front());
+            tx_queue.pop();
+    
+            bool   is_done;
+            size_t added;
+            size_t remaining = max_size - cur_size;
+    
+            std::tie(is_done, added) = e.fill_buffer(remaining, out_buffs);
+    
+            cur_size += added;
+    
+            if (!is_done) {
+                tx_queue.push(std::move(e));
+            }
+    
+            if (cur_size >= max_size) {
+                break;
+            }
+        }
+    
+        return cur_size;
     }
 };
 
@@ -76,7 +118,7 @@ template<class OnConnect>
 inline
 void plex_loop<Stream>::set_on_connect(OnConnect&& h)
 {
-    connect_entry ce(h, std::vector<uint8_t>({1}) /* TODO */);
+    connect_entry ce(std::forward<OnConnect>(h));
     _state->tx_queue.push(std::move(ce));
     start_transmit_loop();
 }
@@ -86,9 +128,12 @@ inline
 void
 plex_loop<Stream>::start_transmit_loop()
 {
-    _tx_buffers.resize(0);
+    if (_tx_buffers.size()) return;
 
-    // TODO: Fill _tx_buffers with data.
+    const size_t max_size = 65536;
+    const size_t size = _state->prepare_payload(max_size, _tx_buffers);
+
+    if (size == 0) return;
 
     asio::async_write(_stream, _tx_buffers
                      , [this, s = _state](sys::error_code ec, size_t)
@@ -101,6 +146,7 @@ plex_loop<Stream>::start_transmit_loop()
 
                            if (ec) return;
 
+                           _tx_buffers.resize(0);
                            start_transmit_loop();
                        });
 }
